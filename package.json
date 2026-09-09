@@ -1,0 +1,13 @@
+{
+  "name": "typst-docx-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Convert semantic Typst thesis content into style-driven, editable DOCX documents.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "sharp": "^0.35.4"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "TypstDocx Bridge"
+  short_description: "Export styled Typst content to editable Word"
+  default_prompt: "Use $export-typst-to-docx to convert a Typst project into a style-driven editable DOCX with headings, figures, three-line tables, editable equations, automatic numbering, and cross-references."

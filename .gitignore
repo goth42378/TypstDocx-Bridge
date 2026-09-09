@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.venv/
+node_modules/
+
+# User projects and generated artifacts must stay outside the packaged skill.
+/examples/*-project/
+!/examples/synthetic-project/
+!/examples/synthetic-project/**
+/examples/*-output/
+/examples/**/*.docx
+/examples/**/*.pdf
+/examples/**/cache/
+/examples/**/conversion-report*.json
+/examples/**/docx-audit*.json
+/examples/**/source-verification*.json
+/examples/**/typst-preflight*.json

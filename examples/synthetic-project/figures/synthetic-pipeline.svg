@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">Synthetic processing pipeline</title>
+  <desc id="desc">Three generic boxes labeled Input, Linear transform, and Output connected by arrows.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4b5563"/>
+    </marker>
+  </defs>
+  <rect width="900" height="260" fill="#ffffff"/>
+  <g font-family="Arial, sans-serif" font-size="30" text-anchor="middle">
+    <rect x="70" y="75" width="200" height="110" rx="12" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="4"/>
+    <text x="170" y="142" fill="#1f2937">Input</text>
+    <rect x="350" y="75" width="200" height="110" rx="12" fill="#edf8ef" stroke="#2f855a" stroke-width="4"/>
+    <text x="450" y="124" fill="#1f2937">Linear</text>
+    <text x="450" y="160" fill="#1f2937">transform</text>
+    <rect x="630" y="75" width="200" height="110" rx="12" fill="#fff4e5" stroke="#c05621" stroke-width="4"/>
+    <text x="730" y="142" fill="#1f2937">Output</text>
+  </g>
+  <line x1="275" y1="130" x2="340" y2="130" stroke="#4b5563" stroke-width="5" marker-end="url(#arrow)"/>
+  <line x1="555" y1="130" x2="620" y2="130" stroke="#4b5563" stroke-width="5" marker-end="url(#arrow)"/>
+</svg>
