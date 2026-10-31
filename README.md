@@ -10,13 +10,15 @@ Typst/PDF 的页面外观逐像素复刻到 Word。
 
 - 将 Typst 的一至三级标题转换为真正的 Word `Heading 1/2/3`。
 - 将正文和题注写入 `Normal`、`Caption` 等命名样式，便于在 Word 中统一修改。
-- 将 PNG、JPEG 和 SVG 图片嵌入 Word；SVG 会通过 `sharp` 转为 PNG。
+- 将 PNG、JPEG、SVG 和单页 PDF 图片嵌入 Word；SVG 和 PDF 会转换为 PNG。
 - 将行内和独立公式转换为可编辑的 Word OMML 公式，而不是公式截图。
 - 将管道式表格转换为可编辑的 Word 三线表。
 - 使用 Word `SEQ` 字段自动编号图、表和公式，并使用 `REF` 字段生成交叉引用。
 - 转换前把所需文件暂存到源库之外，转换后用哈希清单确认源文件未被修改。
 
-当前版本一次转换一个章节，并要求语义内容文件恰好包含一个一级标题。
+支持通过静态 `#include` 装配入口导出多章节正文，并生成西工大格式奇偶页眉、页码和奇数页起章。默认生成未填写的封面、中英文题名页、中英文摘要页和可更新目录；完整参考文献暂不生成。
+支持章节正文中多层静态 `#include`、单层 `+` 编号列表，以及限定形式的 `formula-note` 和 `block(breakable: false)` 内容；图片仍按所属源文件解析相对路径。
+新增、删除或移动整章后，请重新导出，或在 Word 中调整章节列表起始值再更新域。
 
 ## 从哪里转换
 
@@ -51,7 +53,7 @@ Typst 源项目
 - `@fig:...`、`@tab:...`、`@eqt:...` 交叉引用；
 - 其他 `@CitationKey` 以 `[CitationKey]` 文本保留，供后续文献工具处理。
 
-复杂宏、子图、跨行/跨列表格、脚注、代码块、自动展开的多文件正文和完整参考
+其他复杂宏、子图、跨行/跨列表格、脚注、代码块、动态包含的正文和完整参考
 文献渲染目前需要人工检查或扩展解析器。详细边界见
 [`references/compatibility.md`](references/compatibility.md)。
 
@@ -65,6 +67,10 @@ Typst 源项目
 - Tinymist CLI；可直接使用 VS Code Tinymist 扩展目录中的 `tinymist.exe`；
 - Microsoft Office 安装目录中的 `MML2OMML.XSL`；
 - Microsoft Word，推荐用于更新字段和最终目视检查。
+- Poppler 的 `pdfinfo` 和 `pdftoppm`，仅在处理单页 PDF 图片时需要。
+
+整篇正文可使用 `scripts/export_thesis.py`；完整命令和只读要求见
+[`SKILL.md`](SKILL.md) 中的 “Full thesis” 工作流。单章仍可使用下面的原有流程。
 
 仓库不会再分发 Tinymist、Microsoft Office 文件或第三方字体，使用者应自行安装
 并遵守它们各自的许可证。
@@ -97,7 +103,48 @@ py -3 -m venv .venv
 npm install
 ```
 
-## 完整转换示例
+## 整篇论文转换示例
+
+以下命令使用 Windows PowerShell 和占位路径。把入口、工具和项目路径替换为
+自己的实际路径。`$SourceRoot` 只读；`$WorkDir` 和 `$OutputDocx` 必须位于源
+项目之外，并且执行前均不存在。
+
+```powershell
+$Python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
+$SourceRoot = 'D:\path\to\typst-project'
+$Entry = 'template\thesis.typ'
+$WorkDir = 'D:\path\to\conversion-work\thesis-job-01'
+$OutputDocx = 'D:\path\to\conversion-work\thesis.docx'
+$Tinymist = 'C:\path\to\tinymist.exe'
+$Mml2Omml = 'C:\Program Files\Microsoft Office\root\Office16\MML2OMML.XSL'
+$Node = (Get-Command node).Source
+$env:NODE_PATH = (Resolve-Path '.\node_modules').Path
+
+& $Python 'scripts\export_thesis.py' `
+  --source-root $SourceRoot `
+  --entry $Entry `
+  --work-dir $WorkDir `
+  --output $OutputDocx `
+  --tinymist $Tinymist `
+  --mml2omml $Mml2Omml `
+  --node $Node
+if ($LASTEXITCODE -ne 0) { throw '转换失败，请检查工作目录中的 conversion-report.json' }
+
+& pwsh -NoProfile -File 'scripts\refresh_word_fields.ps1' `
+  -Docx $OutputDocx `
+  -Pdf (Join-Path $WorkDir 'qa-preview.pdf')
+if ($LASTEXITCODE -ne 0) { throw 'Word 域更新失败' }
+
+& pwsh -NoProfile -File 'scripts\verify_word_toc.ps1' -Docx $OutputDocx
+if ($LASTEXITCODE -ne 0) { throw '目录核验失败' }
+```
+
+转换报告和源文件核验结果保存在工作目录中。预览 PDF 供检查页面使用，不是
+必须交付的文件。修改正文后应重新更新 Word 域和目录；封面、题名页和摘要默认
+留空，只有显式指定 `--populate-front-matter` 才尝试填入来源文件中的信息。
+参考文献列表目前不导出，正文中的引用键保留为文本。
+
+## 单章转换示例
 
 以下示例使用占位路径。`$SourceRoot` 是只读 Typst 项目，`$WorkRoot` 必须位于
 源项目之外，且 `$StageRoot` 在执行暂存命令前不能已经存在。
@@ -121,12 +168,14 @@ $env:NODE_PATH = (Resolve-Path '.\node_modules').Path
   --source-root $SourceRoot `
   --entry $Entry `
   --destination $StageRoot
+if ($LASTEXITCODE -ne 0) { throw '暂存失败' }
 
 $Content = Join-Path $StageRoot $ContentRelative
 
 & $Python 'scripts\preflight_typst.py' $Content `
   --strict `
   --json (Join-Path $OutputRoot 'typst-preflight.json')
+if ($LASTEXITCODE -ne 0) { throw '预检未通过' }
 
 & $Python 'scripts\build_docx.py' `
   --content $Content `
@@ -138,14 +187,17 @@ $Content = Join-Path $StageRoot $ContentRelative
   --mml2omml $Mml2Omml `
   --node $Node `
   --chapter-number 2
+if ($LASTEXITCODE -ne 0) { throw '转换失败' }
 
 & $Python 'scripts\audit_docx.py' `
   (Join-Path $OutputRoot 'chapter-content.docx') `
   --json (Join-Path $OutputRoot 'docx-audit.json')
+if ($LASTEXITCODE -ne 0) { throw '结构检查失败' }
 
 & $Python 'scripts\verify_source_manifest.py' `
   (Join-Path $StageRoot 'export-manifest.json') `
   --json (Join-Path $OutputRoot 'source-verification.json')
+if ($LASTEXITCODE -ne 0) { throw '源文件核验失败' }
 ```
 
 转换后检查：
@@ -175,6 +227,22 @@ $Content = Join-Path $StageRoot $ContentRelative
 是完全虚构的回归测试材料，覆盖标题、图片、三线表、行内/独立公式以及图表公式
 交叉引用，不包含真实论文内容。可以把它直接传给 `preflight_typst.py` 和
 `build_docx.py` 做环境冒烟测试。
+
+[`examples/synthetic-thesis/main.typ`](examples/synthetic-thesis/main.typ) 是虚构的
+多章节项目，覆盖嵌套包含、图表公式、编号列表和跨章引用。可运行回归测试：
+
+```powershell
+$Python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
+$env:TYPSTDOCX_TINYMIST = 'C:\path\to\tinymist.exe'
+$env:TYPSTDOCX_MML2OMML = 'C:\Program Files\Microsoft Office\root\Office16\MML2OMML.XSL'
+$env:TYPSTDOCX_NODE = (Get-Command node).Source
+$env:NODE_PATH = (Resolve-Path '.\node_modules').Path
+& $Python -m unittest discover -s tests -v
+```
+
+完整转换测试需设置 `TYPSTDOCX_TINYMIST`、`TYPSTDOCX_MML2OMML`、
+`TYPSTDOCX_NODE` 和 `NODE_PATH`；PDF 图片测试还需要 Poppler 及 `reportlab`。
+未提供相关依赖时，测试会标记跳过，不能当作完整链路通过。
 
 ## 隐私与源文件安全
 

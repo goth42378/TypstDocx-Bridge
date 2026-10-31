@@ -8,7 +8,7 @@ description: Extract content from a Typst (.typ) project into an editable, style
 `export-typst-to-docx` is the stable Codex skill identifier. TypstDocx Bridge
 is the public project and UI name.
 
-Create a content-first Word document from one Typst chapter. Preserve semantic content and references; use named Word styles so later template changes propagate globally rather than formatting paragraphs one by one. The current v1 contract is one chapter per conversion. Assemble multiple converted chapters only after each chapter passes its own checks.
+Create a content-first Word document from a semantic Typst chapter or a static multi-chapter assembly. Preserve content and references; use named Word styles so later template changes propagate globally rather than formatting paragraphs one by one. For a full thesis, use the full-document entry point below instead of merging separately produced chapters.
 
 ## Safety rule
 
@@ -27,6 +27,30 @@ cache into `examples/`, `assets/`, or another packaged folder. The bundled
 example is synthetic and may be used only as a smoke-test fixture.
 
 ## Workflow
+
+### Full thesis: staged multi-chapter export
+
+Read `references/compatibility.md` first. The full-document entry point stages the project, expands supported nested static `#include` directives in place while preserving their source-relative image paths, checks labels and references across chapters, creates one DOCX, and verifies the source manifest. Recognized `formula-note`, `block(breakable: false)` and one-level `+` lists preserve their content; unsupported variants must stop for review:
+
+```powershell
+$env:NODE_PATH = '<node-modules-path>'
+python scripts/export_thesis.py `
+  --source-root '<source-root>' `
+  --entry 'template/thesis.typ' `
+  --work-dir '<new-work-directory-outside-source>' `
+  --output '<new-output-file-outside-source>.docx' `
+  --tinymist '<tinymist-executable>' `
+  --mml2omml '<office-MML2OMML.XSL>' `
+  --node '<node-executable>'
+```
+
+By default the exporter creates an unfilled outer cover, Chinese and English title pages, blank Chinese and English abstracts with keyword labels, and a live Word TOC. The TOC includes the abstracts and three levels of chapter headings. Front-matter pages use Roman numerals; body page numbering starts at 1 and continues across chapter sections. Only if the user asks to fill these pages, add `--populate-front-matter` to use static `nwpu-thesis.with(...)` metadata, or combine it with `--front-matter-json '<metadata.json>'`. Report missing fields or unsupported dynamic content. Never fill personal data when blank pages were requested.
+
+Use `--even-header` to override the header derived from the degree. Poppler `pdftoppm` and `pdfinfo` must be on PATH for single-page PDF figures. Do not replace an existing output or work directory: choose new paths. Check `conversion-report.json`, verify both source and staged copy, and render the final file after updating its fields in Word. On Windows with Word installed, `scripts/refresh_word_fields.ps1 -Docx '<output.docx>' -Pdf '<new-qa.pdf>'` updates fields twice and exports a QA PDF; it modifies the generated DOCX in place, so pass only the output copy. Run `scripts/verify_word_toc.ps1 -Docx '<output.docx>'` to check every TOC entry against its target page and the total number of outline headings; also inspect the rendered TOC. The bibliography list is not exported, and citation keys remain in the body. It stops for unsupported content, unresolved references, formula/image failures, and duplicate labels; do not silently deliver a partial result.
+
+This route sets NWPU odd/even page headers, page numbers and odd-page chapter starts, and uses Word fields for cross-chapter references and chapter-prefixed figure/table/equation numbering. Chapter list start values are assigned during export: after inserting, deleting or reordering entire chapters, regenerate the DOCX or adjust Word's chapter list starts and then update all fields. Moving figures/tables/equations within a chapter requires field updates (`Ctrl+A`, `F9`).
+
+### Single chapter
 
 ### 1. Select and stage a project
 
@@ -121,13 +145,10 @@ Require both `source.status` and `staged_copy.status` to be `passed`. Report the
 - Pipe-style Typst tables become native three-line Word tables with repeated header rows.
 - Raster images are embedded; SVG files are rendered to PNG through `sharp`.
 - Inline and display math are exported by Tinymist as MathML, transformed with Office's `MML2OMML.XSL`, and embedded as editable Word OMML equations.
-- Figure, table, and equation serial numbers become Word `SEQ Figure`, `SEQ Table`, and `SEQ Equation` fields that reset at Heading 1. The chapter prefix comes from `--chapter-number`.
+- Figure, table, and equation serial numbers become Word `SEQ Figure`, `SEQ Table`, and `SEQ Equation` fields that reset at Heading 1. For full documents the chapter prefix uses `STYLEREF`; for single chapters it comes from `--chapter-number`.
 - Labels bookmark the complete visible `chapter-sequence` number; references become clickable `REF` fields and update with the sequence fields.
 - Bibliography citations are preserved as `[CitationKey]` text for later citation-manager or template work.
 
-`examples/synthetic-project/` is an invented regression fixture covering
-headings, a heading label, inline and display math, a figure, a three-line
-table, and Word cross-reference targets. It contains no user project material
-and is not required at runtime.
+`examples/synthetic-project/` and `examples/synthetic-thesis/` are invented regression fixtures. The latter exercises nested includes, source-relative images, layout blocks, formula notes, lists and cross-chapter Word references. They contain no user project material and are not required at runtime.
 
 Keep content, numbering, and role assignment semantic. Change appearance through Word style definitions or a replacement template, not repeated paragraph-level formatting.

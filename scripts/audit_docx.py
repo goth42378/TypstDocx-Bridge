@@ -17,7 +17,7 @@ W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 NS = {"w": W, "m": M, "wp": WP}
-FIELD_RE = re.compile(r"\b(SEQ|REF|PAGE|PAGEREF|TOC|NUMPAGES)\b")
+FIELD_RE = re.compile(r"\b(SEQ|REF|PAGE|PAGEREF|TOC|NUMPAGES|STYLEREF)\b", re.IGNORECASE)
 
 
 def read_xml(package: zipfile.ZipFile, name: str):
@@ -27,10 +27,10 @@ def read_xml(package: zipfile.ZipFile, name: str):
 def field_counts(roots) -> Counter:
     counts = Counter()
     for root in roots:
-        for text in root.xpath(".//w:instrText/text()", namespaces=NS):
+        for text in root.xpath(".//w:instrText/text() | .//w:fldSimple/@w:instr", namespaces=NS):
             match = FIELD_RE.search(text)
             if match:
-                counts[match.group(1)] += 1
+                counts[match.group(1).upper()] += 1
     return counts
 
 

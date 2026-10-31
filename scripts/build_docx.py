@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -15,12 +16,14 @@ from typing import Iterable
 
 from lxml import etree, html as lxml_html
 from docx import Document
+from docx.enum.section import WD_SECTION_START
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
+from semantic_expansion import FORMULA_NOTE_MARKER
 
 
 TOKEN_RE = re.compile(r"(\$[^$]+\$|@[A-Za-z0-9_:-]+)")
@@ -47,6 +50,8 @@ class Block:
     rows: list[list[str]] = field(default_factory=list)
     number: str = ""
     bookmark: str = ""
+    source: Path | None = None
+    chapter: int = 0
 
 
 @dataclass
@@ -199,16 +204,20 @@ def parse_equation(raw: str) -> Block:
     return Block(kind="equation", text=math, label=label_match.group(1) if label_match else "")
 
 
-def parse_typst(content: Path) -> list[Block]:
-    lines = content.read_text(encoding="utf-8-sig").splitlines()
+def parse_typst(content: Path, text: str | None = None) -> list[Block]:
+    lines = (content.read_text(encoding="utf-8-sig") if text is None else text).splitlines()
     blocks: list[Block] = []
     paragraph: list[str] = []
 
     def flush() -> None:
         if paragraph:
             text = re.sub(r"\s+", " ", " ".join(item.strip() for item in paragraph)).strip()
+            text = re.sub(r"\s*<[A-Za-z0-9_:-]+>\s*$", "", text)
             if text:
-                blocks.append(Block(kind="paragraph", text=text))
+                if text.startswith(FORMULA_NOTE_MARKER):
+                    blocks.append(Block(kind="formula_note", text=text[len(FORMULA_NOTE_MARKER):]))
+                else:
+                    blocks.append(Block(kind="paragraph", text=text))
             paragraph.clear()
 
     index = 0
@@ -244,10 +253,29 @@ def parse_typst(content: Path) -> list[Block]:
             raw, index = collect_captab(lines, index)
             blocks.append(parse_table(raw))
             continue
+        strong = re.fullmatch(r"#strong\[(.*)\]\s*", stripped)
+        if strong:
+            flush()
+            blocks.append(Block(kind="strong", text=strong.group(1)))
+            index += 1
+            continue
         if starts_display_equation(stripped):
             flush()
             raw, index = collect_equation(lines, index)
             blocks.append(parse_equation(raw))
+            continue
+        item = re.match(r'^\+\s+(.+)$', stripped)
+        if item:
+            flush()
+            pieces = [item.group(1)]
+            index += 1
+            while index < len(lines):
+                following = lines[index].strip()
+                if not following or re.match(r'^(?:\+\s+|=+\s+|#|\$)', following):
+                    break
+                pieces.append(following)
+                index += 1
+            blocks.append(Block(kind="ordered_list_item", text=re.sub(r'\s+', ' ', ' '.join(pieces)).strip()))
             continue
         if stripped.startswith("#"):
             flush()
@@ -259,6 +287,8 @@ def parse_typst(content: Path) -> list[Block]:
         paragraph.append(line)
         index += 1
     flush()
+    for block in blocks:
+        block.source = content
     return blocks
 
 
@@ -268,7 +298,7 @@ def safe_bookmark(label: str) -> str:
     return f"b_{stem}_{digest}"[:40]
 
 
-def assign_numbers(blocks: list[Block], chapter: int) -> dict[str, RefTarget]:
+def assign_numbers(blocks: list[Block], chapter: int, full_document: bool = False) -> dict[str, RefTarget]:
     """Assign cached display numbers and reference metadata.
 
     The generated document uses Word SEQ fields for live numbering. These
@@ -277,15 +307,24 @@ def assign_numbers(blocks: list[Block], chapter: int) -> dict[str, RefTarget]:
     """
     refs: dict[str, RefTarget] = {}
     counters = {"figure": 0, "table": 0, "equation": 0}
+    current_chapter = chapter - 1 if full_document else chapter
     for block in blocks:
+        if full_document and block.kind == "heading" and block.level == 1:
+            current_chapter += 1
+            counters = {"figure": 0, "table": 0, "equation": 0}
+        block.chapter = current_chapter
         if block.kind not in counters:
             continue
+        if current_chapter < chapter:
+            raise ValueError("Figure, table, or equation before the first chapter")
         counters[block.kind] += 1
-        block.number = f"{chapter}-{counters[block.kind]}"
+        block.number = f"{current_chapter}-{counters[block.kind]}"
         if not block.label:
             continue
         block.bookmark = safe_bookmark(block.label)
         target = RefTarget(kind=block.kind, number=block.number, bookmark=block.bookmark)
+        if block.label in refs:
+            raise ValueError(f"Duplicate label: {block.label}")
         refs[block.label] = target
         if block.kind == "equation":
             refs[f"eqt:{block.label}"] = target
@@ -533,15 +572,34 @@ def add_seq_field(paragraph, sequence_name: str, cached_value: str, restart_head
     run_end._r.append(end)
 
 
-def add_automatic_number(paragraph, block: Block, chapter: int, bookmark_id: int) -> None:
+def add_automatic_number(paragraph, block: Block, chapter: int, bookmark_id: int, dynamic_chapter: bool = False) -> None:
     """Append chapter-SEQ numbering and bookmark the complete visible number."""
     if block.bookmark:
         add_bookmark_start(paragraph, block.bookmark, bookmark_id)
-    paragraph.add_run(f"{chapter}-")
+    if dynamic_chapter:
+        add_complex_field(paragraph, ' STYLEREF 1 \\s ', str(chapter))
+        paragraph.add_run("-")
+    else:
+        paragraph.add_run(f"{chapter}-")
     cached_sequence = block.number.rsplit("-", 1)[-1]
     add_seq_field(paragraph, SEQ_NAMES[block.kind], cached_sequence)
     if block.bookmark:
         add_bookmark_end(paragraph, bookmark_id)
+
+
+def add_complex_field(paragraph, instruction: str, cached_value: str) -> None:
+    for tag, value in (("begin", None), ("instruction", instruction), ("separate", None),
+                       ("text", cached_value), ("end", None)):
+        run = paragraph.add_run()
+        if tag in {"begin", "separate", "end"}:
+            node = OxmlElement("w:fldChar")
+            node.set(qn("w:fldCharType"), tag)
+        else:
+            node = OxmlElement("w:instrText" if tag == "instruction" else "w:t")
+            if tag == "instruction":
+                node.set(qn("xml:space"), "preserve")
+            node.text = value
+        run._r.append(node)
 
 
 def add_ref_field(paragraph, target: RefTarget) -> None:
@@ -626,9 +684,29 @@ class FormulaRenderer:
 
 
 def prepare_image(source: Path, cache: Path, node: Path, svg_script: Path, log: BuildLog) -> Path | None:
-    if not source.exists():
+    if not source.is_file():
         log.image_failures.append({"path": str(source), "error": "missing"})
         return None
+    if source.suffix.lower() == ".pdf":
+        executable = shutil.which("pdftoppm")
+        info = shutil.which("pdfinfo")
+        if not executable or not info:
+            log.image_failures.append({"path": str(source), "error": "PDF figures require pdfinfo and pdftoppm on PATH"})
+            return None
+        probe = subprocess.run([info, str(source)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        pages = re.search(r"^Pages:\s*(\d+)", probe.stdout, re.M)
+        if probe.returncode or not pages or int(pages.group(1)) != 1:
+            log.image_failures.append({"path": str(source), "error": "PDF figure must have exactly one page"})
+            return None
+        cache.mkdir(parents=True, exist_ok=True)
+        stem = cache / f"pdf-{hashlib.sha1(source.read_bytes()).hexdigest()[:16]}"
+        output = stem.with_suffix(".png")
+        if not output.exists():
+            result = subprocess.run([executable, "-f", "1", "-l", "1", "-r", "300", "-png", "-singlefile", str(source), str(stem)], capture_output=True, text=True)
+            if result.returncode or not output.exists():
+                log.image_failures.append({"path": str(source), "error": (result.stderr or result.stdout)[-1200:]})
+                return None
+        return output
     if source.suffix.lower() != ".svg":
         return source
     cache.mkdir(parents=True, exist_ok=True)
@@ -757,6 +835,8 @@ def create_template(path: Path) -> None:
     caption = document.styles["Caption"]
     caption.base_style = normal
     set_style_font(caption, "Times New Roman", "宋体", 10.5, "000000")
+    caption.font.bold = False
+    caption._element.get_or_add_rPr().get_or_add_bCs().set(qn("w:val"), "0")
     caption.font.italic = False
     caption.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
     caption.paragraph_format.first_line_indent = Pt(0)
@@ -836,6 +916,7 @@ def attach_heading_numbering(document, chapter_number: int) -> int:
 
     abstract = OxmlElement("w:abstractNum")
     abstract.set(qn("w:abstractNumId"), str(abstract_id))
+    set_numbering_identity(numbering, abstract, abstract_id)
     multi = OxmlElement("w:multiLevelType")
     multi.set(qn("w:val"), "multilevel")
     abstract.append(multi)
@@ -877,7 +958,7 @@ def attach_heading_numbering(document, chapter_number: int) -> int:
         for node in (start, num_fmt, pstyle, text, suff, jc, ppr, rpr):
             lvl.append(node)
         abstract.append(lvl)
-    numbering.append(abstract)
+    insert_abstract_numbering(numbering, abstract)
 
     num = OxmlElement("w:num")
     num.set(qn("w:numId"), str(num_id))
@@ -909,6 +990,27 @@ def attach_heading_numbering(document, chapter_number: int) -> int:
     return num_id
 
 
+def set_numbering_identity(numbering, abstract, abstract_id: int) -> None:
+    used = {node.get(qn('w:val')) for node in numbering.xpath('./w:abstractNum/w:nsid')}
+    salt = 0
+    while True:
+        value = hashlib.sha256(f'typstdocx-{abstract_id}-{salt}'.encode()).hexdigest()[:8].upper()
+        if value not in used:
+            break
+        salt += 1
+    nsid = OxmlElement('w:nsid')
+    nsid.set(qn('w:val'), value)
+    abstract.append(nsid)
+
+
+def insert_abstract_numbering(numbering, abstract) -> None:
+    first_number = numbering.find(qn('w:num'))
+    if first_number is None:
+        numbering.append(abstract)
+    else:
+        numbering.insert(numbering.index(first_number), abstract)
+
+
 def add_page_number(paragraph) -> None:
     paragraph.style = "Footer"
     run_begin = paragraph.add_run()
@@ -931,13 +1033,111 @@ def add_page_number(paragraph) -> None:
     run_end._r.append(end)
 
 
+def chapter_numbering(document, base_num_id: int, chapter: int) -> int:
+    numbering = document.part.numbering_part.element
+    base = next(node for node in numbering.findall(qn("w:num")) if node.get(qn("w:numId")) == str(base_num_id))
+    num_id = max(int(node.get(qn("w:numId"))) for node in numbering.findall(qn("w:num"))) + 1
+    number = OxmlElement("w:num")
+    number.set(qn("w:numId"), str(num_id))
+    abstract = OxmlElement("w:abstractNumId")
+    abstract.set(qn("w:val"), base.find(qn("w:abstractNumId")).get(qn("w:val")))
+    number.append(abstract)
+    override = OxmlElement("w:lvlOverride")
+    override.set(qn("w:ilvl"), "0")
+    start = OxmlElement("w:startOverride")
+    start.set(qn("w:val"), str(chapter))
+    override.append(start)
+    number.append(override)
+    numbering.append(number)
+    return num_id
+
+
+def ordered_list_numbering(document) -> int:
+    numbering = document.part.numbering_part.element
+    abstract_id = max((int(n.get(qn('w:abstractNumId'))) for n in numbering.findall(qn('w:abstractNum'))), default=0) + 1
+    num_id = max((int(n.get(qn('w:numId'))) for n in numbering.findall(qn('w:num'))), default=0) + 1
+    abstract = OxmlElement('w:abstractNum')
+    abstract.set(qn('w:abstractNumId'), str(abstract_id))
+    set_numbering_identity(numbering, abstract, abstract_id)
+    multi = OxmlElement('w:multiLevelType')
+    multi.set(qn('w:val'), 'singleLevel')
+    abstract.append(multi)
+    level = OxmlElement('w:lvl')
+    level.set(qn('w:ilvl'), '0')
+    for tag, value in (('start', '1'), ('numFmt', 'decimal'), ('lvlText', '%1.'), ('suff', 'space'), ('lvlJc', 'left')):
+        node = OxmlElement('w:' + tag)
+        node.set(qn('w:val'), value)
+        level.append(node)
+    ppr = OxmlElement('w:pPr')
+    indent = OxmlElement('w:ind')
+    indent.set(qn('w:left'), '480')
+    indent.set(qn('w:hanging'), '360')
+    ppr.append(indent)
+    level.append(ppr)
+    abstract.append(level)
+    insert_abstract_numbering(numbering, abstract)
+    number = OxmlElement('w:num')
+    number.set(qn('w:numId'), str(num_id))
+    reference = OxmlElement('w:abstractNumId')
+    reference.set(qn('w:val'), str(abstract_id))
+    number.append(reference)
+    numbering.append(number)
+    return num_id
+
+
+def setup_thesis_section(section, title: str, chapter: int, even_header: str) -> None:
+    for header, odd in ((section.header, True), (section.even_page_header, False)):
+        header.is_linked_to_previous = False
+        paragraph = header.paragraphs[0]
+        paragraph.clear()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.style = "Header"
+        if odd:
+            add_complex_field(paragraph, ' STYLEREF 1 \\n ', f"第 {chapter} 章")
+            paragraph.add_run(" ")
+            add_complex_field(paragraph, ' STYLEREF 1 ', title)
+        else:
+            paragraph.add_run(even_header)
+        borders = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        for key, value in (("val", "thinThickSmallGap"), ("sz", "24"), ("space", "1"), ("color", "auto")):
+            bottom.set(qn(f"w:{key}"), value)
+        borders.append(bottom)
+        paragraph._p.get_or_add_pPr().append(borders)
+        for run in paragraph.runs:
+            set_run_font(run, latin="Times New Roman", east_asia="宋体", size=9)
+    for footer in (section.footer, section.even_page_footer):
+        footer.is_linked_to_previous = False
+        paragraph = footer.paragraphs[0]
+        paragraph.clear()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        add_page_number(paragraph)
+
+
 def build_document(args) -> BuildLog:
     log = BuildLog()
-    blocks = parse_typst(args.content)
-    refs = assign_numbers(blocks, args.chapter_number)
+    full_document = getattr(args, "full_document", False)
+    segments = getattr(args, "segments", None)
+    if segments is not None:
+        blocks = [block for segment in segments for block in parse_typst(segment.path, segment.text)]
+    else:
+        contents = getattr(args, "contents", None) or [args.content]
+        blocks = [block for content in contents for block in parse_typst(content)]
+    refs = assign_numbers(blocks, args.chapter_number, full_document)
     document = Document(args.template)
-    attach_heading_numbering(document, args.chapter_number)
-    add_page_number(document.sections[0].footer.paragraphs[0])
+    bundled_template = Path(__file__).resolve().parent.parent / "assets/nwpu-2025-content-template.docx"
+    if args.template.resolve() == bundled_template.resolve():
+        caption_style = document.styles["Caption"]
+        set_style_font(caption_style, "Times New Roman", "宋体", 10.5, "000000")
+        caption_style.font.bold = False
+        caption_style._element.get_or_add_rPr().get_or_add_bCs().set(qn("w:val"), "0")
+    note_style = get_or_add_style(document, "NWPU Formula Note", WD_STYLE_TYPE.PARAGRAPH, "Normal")
+    note_style.paragraph_format.first_line_indent = Pt(0)
+    heading_num_id = attach_heading_numbering(document, args.chapter_number)
+    if full_document:
+        document.settings.odd_and_even_pages_header_footer = True
+    else:
+        add_page_number(document.sections[0].footer.paragraphs[0])
     settings = document.settings.element
     update = settings.find(qn("w:updateFields"))
     if update is None:
@@ -946,15 +1146,48 @@ def build_document(args) -> BuildLog:
     update.set(qn("w:val"), "true")
 
     formula_renderer = FormulaRenderer(args.tinymist, args.mml2omml, args.cache / "formulas", log)
+    front_data = getattr(args, "front_matter", None)
+    if full_document and front_data is not None:
+        import front_matter
+        log.front_missing = front_matter.add_front_matter(document, front_data, args.even_header, formula_renderer, log,
+                                                          blank=not getattr(args, "populate_front_matter", False))
     bookmark_id = 1
+    chapter_count = 0
+    active_num_id = heading_num_id
+    list_num_id = None
     for block in blocks:
         log.bump(block.kind)
+        if block.kind != 'ordered_list_item':
+            list_num_id = None
         if block.kind == "heading":
             level = min(3, max(1, block.level))
+            if full_document and level == 1:
+                section = document.sections[0] if chapter_count == 0 and front_data is None else document.add_section(WD_SECTION_START.ODD_PAGE)
+                if front_data is not None:
+                    import front_matter
+                    front_matter.page_numbering(section, "decimal", 1 if chapter_count == 0 else None)
+                setup_thesis_section(section, block.text, block.chapter, args.even_header)
+                active_num_id = chapter_numbering(document, heading_num_id, block.chapter)
+                chapter_count += 1
             paragraph = document.add_paragraph(style=f"Heading {level}")
+            if full_document:
+                numpr = paragraph._p.get_or_add_pPr().get_or_add_numPr()
+                numpr.get_or_add_ilvl().set(qn("w:val"), str(level - 1))
+                numpr.get_or_add_numId().set(qn("w:val"), str(active_num_id))
             add_inline_content(paragraph, block.text, refs, formula_renderer, log)
-        elif block.kind == "paragraph":
-            paragraph = document.add_paragraph(style="Normal")
+        elif block.kind in {"paragraph", "strong", "formula_note"}:
+            paragraph = document.add_paragraph(style="NWPU Formula Note" if block.kind == "formula_note" else "Normal")
+            add_inline_content(paragraph, block.text, refs, formula_renderer, log)
+            if block.kind == "strong":
+                for run in paragraph.runs:
+                    run.bold = True
+        elif block.kind == 'ordered_list_item':
+            if list_num_id is None:
+                list_num_id = ordered_list_numbering(document)
+            paragraph = document.add_paragraph(style='Normal')
+            numpr = paragraph._p.get_or_add_pPr().get_or_add_numPr()
+            numpr.get_or_add_ilvl().set(qn('w:val'), '0')
+            numpr.get_or_add_numId().set(qn('w:val'), str(list_num_id))
             add_inline_content(paragraph, block.text, refs, formula_renderer, log)
         elif block.kind == "equation":
             paragraph = document.add_paragraph(style="NWPU Equation")
@@ -967,14 +1200,21 @@ def build_document(args) -> BuildLog:
                 set_run_font(run, latin="Cambria Math", east_asia="Cambria Math", size=10)
             paragraph.add_run("\t")
             paragraph.add_run("（")
-            add_automatic_number(paragraph, block, args.chapter_number, bookmark_id)
+            add_automatic_number(paragraph, block, block.chapter, bookmark_id, full_document)
             paragraph.add_run("）")
             log.bump("seq_fields")
             if block.bookmark:
                 bookmark_id += 1
         elif block.kind == "figure":
-            source = (args.content.parent / block.path).resolve()
-            image = prepare_image(source, args.cache / "images", args.node, args.svg_script, log)
+            staged_root = getattr(args, 'staged_root', None)
+            if staged_root and block.path.startswith(('/', '\\')):
+                source = (staged_root / block.path.lstrip('/\\')).resolve()
+            else:
+                source = (block.source.parent / block.path).resolve()
+            if staged_root and not source.is_relative_to(staged_root.resolve()):
+                log.image_failures.append({"path": block.path, "error": "figure escapes the staged project"})
+                source = None
+            image = prepare_image(source, args.cache / "images", args.node, args.svg_script, log) if source else None
             if image:
                 paragraph = document.add_paragraph(style="NWPU Figure")
                 run = paragraph.add_run()
@@ -984,7 +1224,7 @@ def build_document(args) -> BuildLog:
                 paragraph = document.add_paragraph(f"[图片缺失：{block.path}]", style="NWPU Figure")
             caption = document.add_paragraph(style="Caption")
             caption.add_run("图 ")
-            add_automatic_number(caption, block, args.chapter_number, bookmark_id)
+            add_automatic_number(caption, block, block.chapter, bookmark_id, full_document)
             log.bump("seq_fields")
             if block.bookmark:
                 bookmark_id += 1
@@ -992,8 +1232,9 @@ def build_document(args) -> BuildLog:
             add_inline_content(caption, block.caption, refs, formula_renderer, log)
         elif block.kind == "table":
             caption = document.add_paragraph(style="Caption")
+            caption.paragraph_format.keep_with_next = True
             caption.add_run("表 ")
-            add_automatic_number(caption, block, args.chapter_number, bookmark_id)
+            add_automatic_number(caption, block, block.chapter, bookmark_id, full_document)
             log.bump("seq_fields")
             if block.bookmark:
                 bookmark_id += 1

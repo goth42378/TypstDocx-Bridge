@@ -36,8 +36,8 @@ def strip_line_comment(line: str) -> str:
     return line
 
 
-def audit(content: Path) -> dict[str, object]:
-    lines = content.read_text(encoding="utf-8-sig").splitlines()
+def audit(content: Path, text: str | None = None) -> dict[str, object]:
+    lines = (content.read_text(encoding="utf-8-sig") if text is None else text).splitlines()
     active_lines = [strip_line_comment(line) for line in lines]
     heading1_lines: list[int] = []
     labels_with_lines: list[tuple[str, int]] = []
@@ -51,7 +51,8 @@ def audit(content: Path) -> dict[str, object]:
             if HEADING1_RE.match(line.strip()):
                 heading1_lines.append(index)
             command = COMMAND_RE.match(line)
-            if command and command.group(1) not in SUPPORTED_TOP_LEVEL_COMMANDS:
+            supported_strong = bool(re.fullmatch(r"\s*#strong\[[^\[\]]*\]\s*", line))
+            if command and command.group(1) not in SUPPORTED_TOP_LEVEL_COMMANDS and not supported_strong:
                 review_commands.append(
                     {
                         "line": index,
@@ -59,6 +60,10 @@ def audit(content: Path) -> dict[str, object]:
                         "text": line.strip()[:240],
                     }
                 )
+            if re.match(r'^\s*(?:-\s+|\d+\.\s+)', line):
+                review_commands.append({"line": index, "command": "unsupported-list", "text": line.strip()[:240]})
+            if re.match(r'^\s+\+\s+', line):
+                review_commands.append({"line": index, "command": "nested-ordered-list", "text": line.strip()[:240]})
         if len(re.findall(r"(?<!\\)\$", line)) % 2:
             in_math = not in_math
 
